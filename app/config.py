@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     # AI service
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
+    # Backup models, tried in order when the primary cannot serve a request:
+    # Google-side overload (503 "currently experiencing high demand"), a retired
+    # or unavailable model name (404) or exhausted quota (429). Space for
+    # resilience so one saturated model does not take chat down.
+    gemini_fallback_models: Annotated[list[str], NoDecode] = Field(
+        default=[], alias="GEMINI_FALLBACK_MODELS"
+    )
     system_prompt: str = Field(default=DEFAULT_SYSTEM_PROMPT, alias="SYSTEM_PROMPT")
     temperature: float = Field(default=0.7, alias="TEMPERATURE")
     max_output_tokens: int = Field(default=8192, alias="MAX_OUTPUT_TOKENS")
@@ -72,6 +79,40 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
     )
+
+    @property
+    def model_chain(self) -> list[str]:
+        """The primary model followed by its fallbacks, order kept, de-duplicated."""
+        chain: list[str] = []
+        for model in (self.gemini_model, *self.gemini_fallback_models):
+            name = (model or "").strip()
+            if name and name not in chain:
+                chain.append(name)
+        return chain
+
+    @field_validator("gemini_fallback_models", mode="before")
+    @classmethod
+    def parse_model_list(cls, value: object) -> list[str]:
+        """Accept a comma-separated list, a JSON array, or an empty value."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            if text.startswith("["):
+                import json
+
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+                except ValueError:
+                    pass
+            return [item.strip() for item in text.split(",") if item.strip()]
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
 
     @field_validator("cors_origins", mode="before")
     @classmethod

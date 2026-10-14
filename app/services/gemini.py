@@ -7,11 +7,16 @@ Two reliability layers keep long replies complete:
    ``finish_reason=MAX_TOKENS``, the reply is continued from where it stopped
    (up to ``MAX_REPLY_CONTINUATIONS`` times) so answers never truncate
    mid-sentence.
-2. **Transient-error retry + mid-stream resume** — Google-side ``503
-   UNAVAILABLE`` / high-demand spikes are retried with a short backoff before
-   surfacing as 502. If a *connected* stream drops mid-generation (network
-   blip, upstream reset), generation transparently resumes from the text
-   already produced instead of failing the reply.
+2. **Transient-error retry + model fallback** — Google-side ``503
+   UNAVAILABLE`` / high-demand spikes and local network blips (DNS failure,
+   reset or timed-out connection) are retried with a short backoff. A model
+   that is still failing (overloaded, retired, out of quota) is skipped in
+   favour of the next model in ``GEMINI_FALLBACK_MODELS``, so one saturated
+   model does not take chat down with it. Only when every model has failed does
+   the request surface as a 502.
+3. **Mid-stream resume** — if a *connected* stream drops mid-generation
+   (network blip, upstream reset), generation transparently resumes from the
+   text already produced instead of failing the reply.
 """
 
 import itertools
@@ -19,6 +24,7 @@ import logging
 import time
 from collections.abc import Iterator
 
+import httpx
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
@@ -78,6 +84,13 @@ def _generation_config() -> types.GenerateContentConfig:
         thinking_config=types.ThinkingConfig(
             thinking_budget=settings.thinking_budget,
         ),
+        # This service never declares tools, so automatic function calling (AFC)
+        # has nothing to call — it only wraps every call in AFC bookkeeping and
+        # logs "Direct use of AFC ... is not recommended" on each new process.
+        # Disabling it is the SDK's supported way to take the plain path.
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+            disable=True,
+        ),
     )
 
 
@@ -92,12 +105,118 @@ def _finish_reason(response) -> str | None:
     return None
 
 
+def _is_transport_error(exc: Exception) -> bool:
+    """The request never reached Google: DNS failure, refused/reset or timeout.
+
+    Seen in practice as ``ConnectError: [Errno -3] Temporary failure in name
+    resolution`` when the LAN's DNS resolver blinks mid-request. Every model is
+    served from the same endpoint, so trying another model cannot help — but the
+    condition is usually momentary, so a short retry often does.
+    """
+    return isinstance(exc, httpx.TransportError)
+
+
 def _is_transient(exc: Exception) -> bool:
-    """Google-side 5xx (e.g. 503 high demand) — worth retrying."""
+    """Failures worth retrying against the same model.
+
+    Covers Google-side 5xx (503 high demand) and local network blips.
+    """
     if isinstance(exc, genai_errors.ServerError):
+        return True
+    if _is_transport_error(exc):
         return True
     code = getattr(exc, "code", None)
     return isinstance(code, int) and 500 <= code < 600
+
+
+# Upstream codes that mean "this model cannot serve the request right now":
+# 404 = retired or not enabled for this key, 429 = quota exhausted (a different
+# model has its own quota). Neither is fixed by retrying the same model.
+_MODEL_SWITCH_CODES = frozenset({404, 429})
+
+
+def _is_model_switchable(exc: Exception) -> bool:
+    """True when a different model might succeed where this one failed.
+
+    A transport error is deliberately excluded: the same endpoint serves every
+    model, so walking the whole chain would only add latency to an outage the
+    chain cannot fix.
+    """
+    if _is_transport_error(exc):
+        return False
+    if _is_transient(exc):
+        return True
+    code = getattr(exc, "code", None)
+    return isinstance(code, int) and code in _MODEL_SWITCH_CODES
+
+
+def _call_with_fallback(call, *, what: str) -> tuple[object, str]:
+    """Run ``call(model)`` across the configured model chain.
+
+    Each model gets ``_INITIAL_ATTEMPTS`` tries with a short backoff for
+    transient failures; a model still failing after that is skipped in favour
+    of the next one. Returns ``(result, model_used)``. Raises
+    ``AIUnavailableError`` once every model has failed, or immediately for an
+    error no other model can fix (bad request, auth failure).
+    """
+    settings = get_settings()
+    chain = settings.model_chain
+    last_exc: Exception | None = None
+
+    for index, model in enumerate(chain):
+        for attempt in range(_INITIAL_ATTEMPTS):
+            try:
+                result = call(model)
+            except ApiError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if not (_is_transient(exc) or _is_model_switchable(exc)):
+                    logger.warning("%s failed: %s: %s", what, type(exc).__name__, exc)
+                    raise AIUnavailableError() from exc
+                if _is_transient(exc) and attempt < _INITIAL_ATTEMPTS - 1:
+                    logger.warning(
+                        "Transient %s failure (%s), retrying in %.1fs",
+                        what,
+                        type(exc).__name__,
+                        _RETRY_BACKOFF_SECONDS,
+                    )
+                    time.sleep(_RETRY_BACKOFF_SECONDS)
+                    continue
+                if not _is_model_switchable(exc):
+                    # Not a model problem (e.g. the network is down): handing the
+                    # next model the same broken connection only adds delay.
+                    logger.warning(
+                        "%s failed after %d attempts (%s): %s",
+                        what,
+                        _INITIAL_ATTEMPTS,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    raise AIUnavailableError() from exc
+                if index < len(chain) - 1:
+                    logger.warning(
+                        "%s: model %s is unavailable (%s); falling back to %s.",
+                        what,
+                        model,
+                        type(exc).__name__,
+                        chain[index + 1],
+                    )
+                else:
+                    logger.warning(
+                        "%s failed on every model %s: %s: %s",
+                        what,
+                        chain,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    raise AIUnavailableError() from exc
+            else:
+                if index > 0:
+                    logger.info("%s served by fallback model %s.", what, model)
+                return result, model
+
+    raise AIUnavailableError() from last_exc  # pragma: no cover
 
 
 # --- Non-streaming ----------------------------------------------------------
@@ -112,29 +231,14 @@ def generate_reply(history: list, user_message: str) -> tuple[str, str]:
     contents = _build_contents(history, user_message)
     parts: list[str] = []
 
-    for attempt in range(_INITIAL_ATTEMPTS):
-        try:
-            response = get_client().models.generate_content(
-                model=settings.gemini_model,
-                contents=contents,
-                config=_generation_config(),
-            )
-            break
-        except ApiError:
-            raise
-        except Exception as exc:
-            if _is_transient(exc) and attempt < _INITIAL_ATTEMPTS - 1:
-                logger.warning(
-                    "Transient Gemini failure (%s), retrying in %.1fs",
-                    type(exc).__name__,
-                    _RETRY_BACKOFF_SECONDS,
-                )
-                time.sleep(_RETRY_BACKOFF_SECONDS)
-                continue
-            logger.warning("Gemini request failed: %s: %s", type(exc).__name__, exc)
-            raise AIUnavailableError() from exc
-    else:  # pragma: no cover - loop always breaks or raises
-        raise AIUnavailableError()
+    response, model = _call_with_fallback(
+        lambda candidate: get_client().models.generate_content(
+            model=candidate,
+            contents=contents,
+            config=_generation_config(),
+        ),
+        what="Gemini request",
+    )
 
     text = (response.text or "").strip()
     if not text:
@@ -153,7 +257,7 @@ def generate_reply(history: list, user_message: str) -> tuple[str, str]:
         ]
         try:
             response = get_client().models.generate_content(
-                model=settings.gemini_model,
+                model=model,
                 contents=contents,
                 config=_generation_config(),
             )
@@ -168,50 +272,38 @@ def generate_reply(history: list, user_message: str) -> tuple[str, str]:
             break
         parts.append(continuation)
 
-    return "\n".join(parts), settings.gemini_model
+    return "\n".join(parts), model
 
 
 # --- Streaming --------------------------------------------------------------
 
 
 def _open_stream(contents: list[types.Content]):
-    """Start a streamed generation, retrying transient failures.
+    """Start a streamed generation, retrying and falling back across models.
 
     The SDK defers the HTTP request until the first chunk is pulled, so the
     first chunk is consumed eagerly here: a 503/overload on connection
-    surfaces in this function and can be retried. The returned iterator
-    re-yields that first chunk followed by the rest of the stream.
+    surfaces in this function and can be retried — or handed to the next model
+    in the chain. The returned iterator re-yields that first chunk followed by
+    the rest of the stream.
     """
-    settings = get_settings()
-    last_exc: Exception | None = None
-    for attempt in range(_INITIAL_ATTEMPTS):
+
+    def start(model: str):
+        stream = get_client().models.generate_content_stream(
+            model=model,
+            contents=contents,
+            config=_generation_config(),
+        )
         try:
-            stream = get_client().models.generate_content_stream(
-                model=settings.gemini_model,
-                contents=contents,
-                config=_generation_config(),
-            )
             first = next(stream)  # forces the request; may raise the 503
-            return itertools.chain([first], stream)
         except StopIteration:
             # Stream connected but produced nothing at all.
             logger.warning("Gemini stream produced no content.")
             raise AIUnavailableError()
-        except ApiError:
-            raise
-        except Exception as exc:
-            last_exc = exc
-            if _is_transient(exc) and attempt < _INITIAL_ATTEMPTS - 1:
-                logger.warning(
-                    "Transient Gemini stream failure (%s), retrying in %.1fs",
-                    type(exc).__name__,
-                    _RETRY_BACKOFF_SECONDS,
-                )
-                time.sleep(_RETRY_BACKOFF_SECONDS)
-                continue
-            logger.warning("Gemini stream failed: %s: %s", type(exc).__name__, exc)
-            raise AIUnavailableError() from exc
-    raise AIUnavailableError() from last_exc  # pragma: no cover
+        return itertools.chain([first], stream)
+
+    iterator, _model = _call_with_fallback(start, what="Gemini stream")
+    return iterator
 
 
 def stream_reply(history: list, user_message: str) -> Iterator[str]:

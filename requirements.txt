@@ -17,7 +17,10 @@ bcrypt==5.0.0
 PyJWT==2.14.0
 
 google-genai==2.23.0
+# Imported directly by app/services/gemini.py to tell a local network failure
+# (DNS/connection) apart from an upstream model failure. Also a hard
+# requirement of google-genai and the transport under fastapi's TestClient.
+httpx==0.28.1
 
 # Testing
 pytest==9.0.2
-httpx==0.28.1
